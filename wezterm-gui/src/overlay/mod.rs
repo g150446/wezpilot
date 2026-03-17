@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use wezterm_term::{TerminalConfiguration, TerminalSize};
 
+pub mod ai_chat;
 pub mod confirm;
 pub mod confirm_close_pane;
 pub mod copy;
@@ -15,6 +16,7 @@ pub mod prompt;
 pub mod quickselect;
 pub mod selector;
 
+pub use ai_chat::ai_chat_overlay;
 pub use confirm_close_pane::{
     confirm_close_pane, confirm_close_tab, confirm_close_window, confirm_quit_program,
 };

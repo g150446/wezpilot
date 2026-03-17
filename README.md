@@ -12,6 +12,116 @@ User facing docs and guide at: https://wezterm.org/
 
 https://wezterm.org/installation
 
+## Running this fork on macOS
+
+If you want to try the code in this repository, the simplest way on macOS is to
+build and run it from source.
+
+### Prerequisites
+
+- Install Apple's command line tools:
+
+  ```console
+  xcode-select --install
+  ```
+
+- Install Rust with `rustup`: https://rustup.rs/
+
+### Build
+
+From the repository root:
+
+```console
+cargo build -p wezterm-gui --release
+```
+
+The GUI binary will be built at:
+
+```text
+target/release/wezterm-gui
+```
+
+### Run
+
+To launch it directly from the repository checkout:
+
+```console
+cargo run -p wezterm-gui --release
+```
+
+Or run the built binary directly:
+
+```console
+./target/release/wezterm-gui
+```
+
+If you already have another WezTerm installed on your Mac, a temporary test run
+can accidentally try to connect to that existing mux server and fail with a
+version mismatch. For a clean one-off test launch, prefer:
+
+```console
+cargo run -p wezterm-gui --release -- --always-new-process --no-auto-connect
+```
+
+If needed, quit the existing WezTerm first:
+
+```console
+osascript -e 'tell application "WezTerm" to quit'
+```
+
+### Install on your own Mac
+
+If you want to keep using the version built from this repository on your Mac,
+one practical approach is:
+
+1. Build the release binary:
+
+   ```console
+   cargo build -p wezterm-gui --release
+   ```
+
+2. Copy it somewhere on your `PATH`, for example:
+
+   ```console
+   mkdir -p ~/.local/bin
+   cp ./target/release/wezterm-gui ~/.local/bin/wezpilot-wezterm
+   ```
+
+3. Add that directory to your shell startup file if needed:
+
+   ```console
+   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+   ```
+
+4. Restart your shell, then launch it with:
+
+   ```console
+   wezpilot-wezterm
+   ```
+
+If you only want the official WezTerm release on macOS rather than this source
+tree, the standard Homebrew install is:
+
+```console
+brew install --cask wezterm
+```
+
+## AI chat overlay
+
+This fork adds a small AI chat overlay for the active pane.
+
+- Open it with `Ctrl+Shift+A`
+- Use a normal prompt for one-shot help and command generation
+- Use `/watch <instruction>` to keep monitoring the active pane and auto-respond
+- Use `/watch off` to stop automation
+
+The overlay uses OpenRouter model `moonshotai/kimi-k2.5` and expects the API key
+in the `OPENROUTER_API_KEY` environment variable:
+
+```console
+export OPENROUTER_API_KEY=...
+```
+
 ## Getting help
 
 This is a spare time project, so please bear with me.  There are a couple of channels for support:

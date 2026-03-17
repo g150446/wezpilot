@@ -798,6 +798,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Help"],
             icon: Some("cod_debug"),
         },
+        ShowAiChat => CommandDef {
+            brief: "Show AI chat".into(),
+            doc: "Opens the AI chat overlay for the active pane".into(),
+            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "a".into())],
+            args: &[ArgType::ActivePane],
+            menubar: &["Shell"],
+            icon: Some("md_robot_outline"),
+        },
         InputSelector(_) => CommandDef {
             brief: "Prompt the user to choose from a list".into(),
             doc: "Activates the selector overlay and wait for input".into(),
@@ -2134,6 +2142,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ActivatePaneDirection(PaneDirection::Down),
         TogglePaneZoomState,
         ActivateLastTab,
+        ShowAiChat,
         ShowLauncher,
         ShowTabNavigator,
         // ----------------- Help

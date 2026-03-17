@@ -5,6 +5,7 @@ use crate::colorease::ColorEase;
 use crate::frontend::{front_end, try_front_end};
 use crate::inputmap::InputMap;
 use crate::overlay::{
+    ai_chat_overlay,
     confirm_close_pane, confirm_close_tab, confirm_close_window, confirm_quit_program, launcher,
     start_overlay, start_overlay_pane, CopyModeParams, CopyOverlay, LauncherArgs, LauncherFlags,
     QuickSelectOverlay,
@@ -2367,6 +2368,20 @@ impl TermWindow {
         promise::spawn::spawn(future).detach();
     }
 
+    fn show_ai_chat(&mut self) {
+        let pane = match self.get_active_pane_no_overlay() {
+            Some(pane) => pane,
+            None => return,
+        };
+
+        let pane_id = pane.pane_id();
+        let (overlay, future) = start_overlay_pane(self, &pane, move |_pane_id, term| {
+            ai_chat_overlay(term, pane_id)
+        });
+        self.assign_overlay_for_pane(pane_id, overlay);
+        promise::spawn::spawn(future).detach();
+    }
+
     fn show_tab_navigator(&mut self) {
         let mux = Mux::get();
         let active_tab_idx = match mux.get_window(self.mux_window_id) {
@@ -2777,6 +2792,7 @@ impl TermWindow {
             ScrollToBottom => self.scroll_to_bottom(pane),
             ShowTabNavigator => self.show_tab_navigator(),
             ShowDebugOverlay => self.show_debug_overlay(),
+            ShowAiChat => self.show_ai_chat(),
             ShowLauncher => self.show_launcher(),
             ShowLauncherArgs(args) => {
                 let title = args.title.clone().unwrap_or("Launcher".to_string());
