@@ -57,16 +57,16 @@ Or run the built binary directly:
 
 If you already have another WezTerm installed on your Mac, a temporary test run
 can accidentally try to connect to that existing mux server and fail with a
-version mismatch. For a clean one-off test launch, prefer:
-
-```console
-cargo run -p wezterm-gui --release -- --always-new-process --no-auto-connect
-```
-
-If needed, quit the existing WezTerm first:
+version mismatch. Quit the existing WezTerm first:
 
 ```console
 osascript -e 'tell application "WezTerm" to quit'
+```
+
+Then run normally:
+
+```console
+cargo run -p wezterm-gui
 ```
 
 ### Install on your own Mac

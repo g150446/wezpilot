@@ -11,9 +11,12 @@ use clap::{Parser, ValueHint};
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{ConfigHandle, SerialDomain, SshDomain, SshMultiplexing};
 use mux::activity::Activity;
-use mux::domain::{Domain, LocalDomain};
+use mux::domain::{Domain, LocalDomain, SplitSource};
+use mux::pane::PaneId;
+use mux::tab::{SplitDirection, SplitRequest, SplitSize};
 use mux::Mux;
 use mux_lua::MuxDomain;
+use std::sync::OnceLock;
 use portable_pty::cmdbuilder::CommandBuilder;
 use promise::spawn::block_on;
 use std::borrow::Cow;
@@ -64,6 +67,10 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 pub use selection::SelectionMode;
 pub use termwindow::{set_window_class, set_window_position, TermWindow, ICON_DATA};
+
+/// Holds the (terminal_pane_id, chat_pane_id) created at startup for the auto-split AI chat.
+/// Set once by `spawn_tab_in_domain_if_mux_is_empty`; consumed by `TermWindow::new_window`.
+pub static STARTUP_AI_CHAT: OnceLock<(PaneId, PaneId)> = OnceLock::new();
 
 #[derive(Debug, Parser)]
 #[command(
@@ -331,7 +338,7 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
     });
 
     let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi());
-    let _tab = domain
+    let tab = domain
         .spawn(
             config.initial_size(dpi as u32, Some(cell_pixel_dims(&config, dpi)?)),
             cmd,
@@ -339,6 +346,37 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
             window_id,
         )
         .await?;
+
+    // Split the initial pane 70/30: left = terminal, right = AI chat
+    let terminal_pane = tab.get_active_pane().expect("initial tab must have a pane");
+    let terminal_pane_id = terminal_pane.pane_id();
+
+    match mux
+        .split_pane(
+            terminal_pane_id,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                target_is_second: true,
+                top_level: false,
+                size: SplitSize::Percent(30),
+            },
+            SplitSource::Spawn {
+                command: None,
+                command_dir: None,
+            },
+            SpawnTabDomain::CurrentPaneDomain,
+        )
+        .await
+    {
+        Ok((chat_pane, _size)) => {
+            let chat_pane_id = chat_pane.pane_id();
+            STARTUP_AI_CHAT.set((terminal_pane_id, chat_pane_id)).ok();
+        }
+        Err(err) => {
+            log::warn!("Failed to split initial pane for AI chat: {:#}", err);
+        }
+    }
+
     trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
     Ok(())
 }

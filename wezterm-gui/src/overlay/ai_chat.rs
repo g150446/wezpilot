@@ -6,7 +6,8 @@ use mux::Mux;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use termwiz::color::ColorAttribute;
+use termwiz::cell::{unicode_column_width, AttributeChange, Intensity};
+use termwiz::color::{AnsiColor, ColorAttribute};
 use termwiz::input::{InputEvent, KeyCode, KeyEvent};
 use termwiz::surface::{Change, CursorVisibility, Position};
 use termwiz::terminal::Terminal;
@@ -17,6 +18,24 @@ const OPENROUTER_MODEL: &str = "moonshotai/kimi-k2.5";
 const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 const CONTEXT_LINES: usize = 48;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+const SCROLL_STEP: usize = 5;
+
+/// Fallback for GUI apps (macOS Dock/Finder launch) that don't inherit shell env vars.
+/// Spawns a login shell to read a single environment variable.
+fn read_env_from_login_shell(var: &str) -> Option<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let output = std::process::Command::new(&shell)
+        .args(["-l", "-c", &format!("printenv {}", var)])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    None
+}
 
 const SYSTEM_PROMPT: &str = r#"You are an automation assistant for a terminal emulator.
 You receive:
@@ -26,7 +45,7 @@ You receive:
 Respond with exactly one JSON object and no surrounding prose.
 Schema:
 {
-  "message": "short natural-language reply for the chat window",
+  "message": "reply shown in the chat window (may be multi-line for translations/explanations)",
   "actions": [
     { "kind": "run_command", "command": "cd .." },
     { "kind": "send_input", "text": "yes", "submit": true },
@@ -39,9 +58,81 @@ Rules:
 - Use "send_input" to type plain text into an interactive program.
 - Use "send_keys" for prompt navigation. Allowed keys: Enter, Tab, Escape, UpArrow, DownArrow, LeftArrow, RightArrow, Home, End.
 - Return an empty actions array when no terminal input should be sent.
-- Keep "message" short and practical.
 - Never include markdown fences.
+- For display-only tasks (translation, explanation, summarisation):
+  - Put the full result in "message", preserving line breaks with \n.
+  - Return an empty actions array.
+  - When translating, translate ALL lines of the terminal output faithfully.
 "#;
+
+// ── Styled transcript types ───────────────────────────────────────────────────
+
+struct StyledSpan {
+    text: String,
+    fg: Option<AnsiColor>,
+    bold: bool,
+    dim: bool,
+}
+
+#[derive(Default)]
+struct StyledLine(Vec<StyledSpan>);
+
+impl StyledLine {
+    fn plain(text: impl Into<String>) -> Self {
+        Self(vec![StyledSpan {
+            text: text.into(),
+            fg: None,
+            bold: false,
+            dim: false,
+        }])
+    }
+
+    fn colored(text: impl Into<String>, fg: AnsiColor, bold: bool) -> Self {
+        Self(vec![StyledSpan {
+            text: text.into(),
+            fg: Some(fg),
+            bold,
+            dim: false,
+        }])
+    }
+
+    fn dim(text: impl Into<String>, fg: AnsiColor) -> Self {
+        Self(vec![StyledSpan {
+            text: text.into(),
+            fg: Some(fg),
+            bold: false,
+            dim: true,
+        }])
+    }
+
+    fn emit(&self, changes: &mut Vec<Change>) {
+        for span in &self.0 {
+            if span.bold {
+                changes.push(Change::Attribute(AttributeChange::Intensity(
+                    Intensity::Bold,
+                )));
+            } else if span.dim {
+                changes.push(Change::Attribute(AttributeChange::Intensity(
+                    Intensity::Half,
+                )));
+            }
+            if let Some(fg) = span.fg {
+                changes.push(Change::Attribute(AttributeChange::Foreground(
+                    ColorAttribute::PaletteIndex(fg as u8),
+                )));
+            }
+            changes.push(Change::Text(span.text.clone()));
+            changes.push(Change::Attribute(AttributeChange::Intensity(
+                Intensity::Normal,
+            )));
+            changes.push(Change::Attribute(AttributeChange::Foreground(
+                ColorAttribute::Default,
+            )));
+        }
+    }
+}
+
+// ── Data model ────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 struct TranscriptEntry {
@@ -60,9 +151,17 @@ struct AssistantReply {
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum AssistantAction {
-    RunCommand { command: String },
-    SendInput { text: String, #[serde(default)] submit: bool },
-    SendKeys { keys: Vec<String> },
+    RunCommand {
+        command: String,
+    },
+    SendInput {
+        text: String,
+        #[serde(default)]
+        submit: bool,
+    },
+    SendKeys {
+        keys: Vec<String>,
+    },
 }
 
 #[derive(Serialize)]
@@ -121,6 +220,8 @@ enum ActionRisk {
     NeedsConfirmation(&'static str),
 }
 
+// ── Overlay struct ────────────────────────────────────────────────────────────
+
 struct AiChatOverlay {
     pane_id: PaneId,
     pane_title: String,
@@ -130,6 +231,10 @@ struct AiChatOverlay {
     status: String,
     automation_directive: Option<String>,
     last_automation_snapshot: Option<String>,
+    /// Lines scrolled up from the bottom (0 = pinned to latest message).
+    scroll_offset: usize,
+    /// Cursor position in input buffer (0 = start, len = end)
+    cursor_position: usize,
 }
 
 impl AiChatOverlay {
@@ -148,15 +253,15 @@ impl AiChatOverlay {
             transcript: vec![TranscriptEntry {
                 role: "system",
                 text: format!(
-                    "Ready. Enter a prompt, or use `/watch <instruction>` to keep monitoring the active pane. `/watch off` disables automation."
+                    "Ready. Type a message, or use `/watch <instruction>` to monitor the terminal. `/watch off` to disable."
                 ),
             }],
             input_buffer: String::new(),
-            status: format!(
-                "Model: {OPENROUTER_MODEL} | API key env: {OPENROUTER_API_KEY_ENV}"
-            ),
+            status: format!("{OPENROUTER_MODEL}"),
             automation_directive: None,
             last_automation_snapshot: None,
+            scroll_offset: 0,
+            cursor_position: 0,
         })
     }
 
@@ -172,6 +277,13 @@ impl AiChatOverlay {
                     if self.handle_key_event(key, term)? {
                         return Ok(());
                     }
+                }
+                // IME-composed text (Japanese, Chinese, etc.) arrives as Paste events.
+                Some(InputEvent::Paste(s)) => {
+                    let byte_pos = char_to_byte_idx(&self.input_buffer, self.cursor_position);
+                    self.input_buffer.insert_str(byte_pos, &s);
+                    self.cursor_position += s.chars().count();
+                    self.render(term)?;
                 }
                 Some(_) => {}
                 None => {
@@ -191,17 +303,51 @@ impl AiChatOverlay {
             KeyCode::Enter => {
                 let input = self.input_buffer.trim().to_string();
                 self.input_buffer.clear();
+                self.cursor_position = 0;
                 if !input.is_empty() {
                     self.handle_submission(input, term)?;
-                } else {
-                    self.status = "Type a prompt or press Esc to close.".to_string();
                 }
             }
             KeyCode::Backspace => {
-                self.input_buffer.pop();
+                if self.cursor_position > 0 {
+                    let byte_pos = char_to_byte_idx(&self.input_buffer, self.cursor_position - 1);
+                    self.input_buffer.remove(byte_pos);
+                    self.cursor_position -= 1;
+                }
+            }
+            KeyCode::Delete => {
+                let char_count = self.input_buffer.chars().count();
+                if self.cursor_position < char_count {
+                    let byte_pos = char_to_byte_idx(&self.input_buffer, self.cursor_position);
+                    self.input_buffer.remove(byte_pos);
+                }
+            }
+            KeyCode::LeftArrow => {
+                if self.cursor_position > 0 {
+                    self.cursor_position -= 1;
+                }
+            }
+            KeyCode::RightArrow => {
+                if self.cursor_position < self.input_buffer.chars().count() {
+                    self.cursor_position += 1;
+                }
+            }
+            KeyCode::Home => {
+                self.cursor_position = 0;
+            }
+            KeyCode::End => {
+                self.cursor_position = self.input_buffer.chars().count();
+            }
+            KeyCode::PageUp => {
+                self.scroll_offset = self.scroll_offset.saturating_add(SCROLL_STEP);
+            }
+            KeyCode::PageDown => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(SCROLL_STEP);
             }
             KeyCode::Char(c) if !event.modifiers.contains(termwiz::input::Modifiers::CTRL) => {
-                self.input_buffer.push(c);
+                let byte_pos = char_to_byte_idx(&self.input_buffer, self.cursor_position);
+                self.input_buffer.insert(byte_pos, c);
+                self.cursor_position += 1;
             }
             _ => {}
         }
@@ -210,12 +356,16 @@ impl AiChatOverlay {
         Ok(false)
     }
 
-    fn handle_submission(&mut self, input: String, term: &mut TermWizTerminal) -> anyhow::Result<()> {
+    fn handle_submission(
+        &mut self,
+        input: String,
+        term: &mut TermWizTerminal,
+    ) -> anyhow::Result<()> {
         if input == "/watch off" || input == "/unwatch" {
             self.automation_directive = None;
             self.last_automation_snapshot = None;
             self.push_system("Automation disabled.");
-            self.status = "Automation disabled.".to_string();
+            self.status = "Automation off.".to_string();
             return Ok(());
         }
 
@@ -250,7 +400,7 @@ impl AiChatOverlay {
             self.last_automation_snapshot = Some(pane_snapshot.clone());
         }
 
-        self.status = "Waiting for OpenRouter...".to_string();
+        self.status = "Thinking…".to_string();
         self.render(term)?;
 
         match self.query_openrouter(instruction, &pane_snapshot, false) {
@@ -258,8 +408,8 @@ impl AiChatOverlay {
                 self.apply_reply(reply, &pane_snapshot, false, term)?;
             }
             Err(err) => {
-                self.push_system(format!("OpenRouter request failed: {err:#}"));
-                self.status = "OpenRouter request failed.".to_string();
+                self.push_system(format!("Error: {err:#}"));
+                self.status = "Request failed.".to_string();
             }
         }
         Ok(())
@@ -276,7 +426,7 @@ impl AiChatOverlay {
         }
         self.last_automation_snapshot = Some(snapshot.clone());
 
-        self.status = "Automation is checking the latest pane output...".to_string();
+        self.status = "Watching…".to_string();
         self.render(term)?;
 
         match self.query_openrouter(&directive, &snapshot, true) {
@@ -284,7 +434,7 @@ impl AiChatOverlay {
                 if !reply.message.trim().is_empty() || !reply.actions.is_empty() {
                     self.apply_reply(reply, &snapshot, true, term)?;
                 } else {
-                    self.status = "Automation idle.".to_string();
+                    self.status = format!("{OPENROUTER_MODEL} │ watching");
                 }
             }
             Err(err) => {
@@ -309,11 +459,7 @@ impl AiChatOverlay {
         }
 
         if reply.actions.is_empty() {
-            self.status = if automated {
-                "Automation observed output but took no action.".to_string()
-            } else {
-                "No terminal input was sent.".to_string()
-            };
+            self.status = OPENROUTER_MODEL.to_string();
             self.render(term)?;
             return Ok(());
         }
@@ -322,11 +468,7 @@ impl AiChatOverlay {
             self.execute_action(action, pane_snapshot, term)?;
         }
 
-        self.status = if automated {
-            "Automation action applied.".to_string()
-        } else {
-            "Action applied.".to_string()
-        };
+        self.status = OPENROUTER_MODEL.to_string();
         self.render(term)?;
         Ok(())
     }
@@ -365,7 +507,7 @@ impl AiChatOverlay {
 
                 pane.send_paste(command)?;
                 pane.key_down(PaneKeyCode::Char('\r'), KeyModifiers::NONE)?;
-                self.push_system(format!("Ran command: {command}"));
+                self.push_system(format!("Ran: {command}"));
             }
             AssistantAction::SendInput { text, submit } => {
                 let text = text.trim_end();
@@ -384,8 +526,8 @@ impl AiChatOverlay {
                             term,
                         )?;
                         if !allowed {
-                            self.push_system(format!("Blocked prompt response: {text}"));
-                            self.status = "Prompt response blocked.".to_string();
+                            self.push_system(format!("Blocked input: {text}"));
+                            self.status = "Input blocked.".to_string();
                             return Ok(());
                         }
                     }
@@ -396,7 +538,7 @@ impl AiChatOverlay {
                     pane.key_down(PaneKeyCode::Char('\r'), KeyModifiers::NONE)?;
                 }
                 self.push_system(format!(
-                    "Sent input: `{text}`{}",
+                    "Sent: `{text}`{}",
                     if submit { " + Enter" } else { "" }
                 ));
             }
@@ -416,7 +558,7 @@ impl AiChatOverlay {
                             term,
                         )?;
                         if !allowed {
-                            self.push_system(format!("Blocked key sequence: {}", keys.join(", ")));
+                            self.push_system(format!("Blocked keys: {}", keys.join(", ")));
                             self.status = "Key sequence blocked.".to_string();
                             return Ok(());
                         }
@@ -426,7 +568,7 @@ impl AiChatOverlay {
                 for key in &keys {
                     pane.key_down(parse_pane_key(key)?, KeyModifiers::NONE)?;
                 }
-                self.push_system(format!("Sent keys: {}", keys.join(", ")));
+                self.push_system(format!("Keys: {}", keys.join(", ")));
             }
         }
 
@@ -440,6 +582,8 @@ impl AiChatOverlay {
         automated: bool,
     ) -> anyhow::Result<AssistantReply> {
         let api_key = std::env::var(OPENROUTER_API_KEY_ENV)
+            .ok()
+            .or_else(|| read_env_from_login_shell(OPENROUTER_API_KEY_ENV))
             .with_context(|| format!("missing environment variable {OPENROUTER_API_KEY_ENV}"))?;
 
         let request = OpenRouterRequest {
@@ -475,7 +619,8 @@ impl AiChatOverlay {
             .error_for_status()
             .context("OpenRouter returned an error status")?;
 
-        let response: OpenRouterResponse = response.json().context("decoding OpenRouter response")?;
+        let response: OpenRouterResponse =
+            response.json().context("decoding OpenRouter response")?;
         let raw = response
             .choices
             .into_iter()
@@ -516,6 +661,7 @@ impl AiChatOverlay {
     }
 
     fn push_user(&mut self, text: impl Into<String>) {
+        self.scroll_offset = 0;
         self.transcript.push(TranscriptEntry {
             role: "user",
             text: text.into(),
@@ -523,6 +669,7 @@ impl AiChatOverlay {
     }
 
     fn push_assistant(&mut self, text: impl Into<String>) {
+        self.scroll_offset = 0;
         self.transcript.push(TranscriptEntry {
             role: "assistant",
             text: text.into(),
@@ -530,143 +677,295 @@ impl AiChatOverlay {
     }
 
     fn push_system(&mut self, text: impl Into<String>) {
+        self.scroll_offset = 0;
         self.transcript.push(TranscriptEntry {
             role: "system",
             text: text.into(),
         });
     }
 
+    // ── Rendering ─────────────────────────────────────────────────────────────
+
     fn render(&self, term: &mut TermWizTerminal) -> anyhow::Result<()> {
         let size = term.get_screen_size()?;
-        let width = size.cols.max(40);
-        let height = size.rows.max(12);
-        let box_width = (width * 85 / 100).max(40).min(width.saturating_sub(2));
-        let box_height = (height * 70 / 100).max(10).min(height.saturating_sub(2));
-        let x = (width.saturating_sub(box_width)) / 2;
-        let y = (height.saturating_sub(box_height)) / 2;
-        let inner_width = box_width.saturating_sub(4).max(10);
-        let transcript_height = box_height.saturating_sub(8).max(1);
+        let w = size.cols.max(20);
+        let h = size.rows.max(10);
 
-        let mut changes = vec![
+        // 7:3 split between transcript (top) and input (bottom).
+        //
+        // Row 0             : header
+        // Row 1             : separator
+        // Row 2..split-1    : transcript  (split-2 rows)
+        // Row split         : separator
+        // Row split+1       : status / hints
+        // Row split+2       : separator
+        // Row split+3..h-1  : input area  (h-split-3 rows)
+
+        let split = ((h * 7 / 10).max(5)).min(h.saturating_sub(5));
+        let transcript_h = split.saturating_sub(2).max(1);
+        let input_first_row = split + 3;
+        let input_h = h.saturating_sub(input_first_row).max(1);
+        // Width available for input text after the "  ❯ " prefix (4 chars).
+        let input_text_w = w.saturating_sub(4).max(1);
+
+        let mut c: Vec<Change> = vec![
             Change::ClearScreen(ColorAttribute::Default),
             Change::CursorVisibility(CursorVisibility::Hidden),
         ];
 
-        let horizontal = format!("+{}+", "-".repeat(box_width.saturating_sub(2)));
-        push_line(&mut changes, x, y, &horizontal);
-        for row in 1..box_height.saturating_sub(1) {
-            push_line(
-                &mut changes,
-                x,
-                y + row,
-                &format!("|{}|", " ".repeat(box_width.saturating_sub(2))),
-            );
+        // ── Header ──────────────────────────────────────────────────────────
+        at(&mut c, 0, 0);
+        c.push(Change::Attribute(AttributeChange::Reverse(true)));
+        c.push(Change::Attribute(AttributeChange::Intensity(
+            Intensity::Bold,
+        )));
+        let header = format!("  AI Chat — {}", self.pane_title);
+        c.push(Change::Text(pad_right(&header, w)));
+        c.push(Change::Attribute(AttributeChange::Reverse(false)));
+        c.push(Change::Attribute(AttributeChange::Intensity(
+            Intensity::Normal,
+        )));
+
+        // ── Top separator ────────────────────────────────────────────────────
+        self.draw_separator(&mut c, 0, 1, w);
+
+        // ── Transcript ───────────────────────────────────────────────────────
+        let lines = self.render_transcript(w);
+        let total = lines.len();
+        let max_scroll = total.saturating_sub(transcript_h);
+        let scroll = self.scroll_offset.min(max_scroll);
+        let lo = total.saturating_sub(transcript_h + scroll);
+        let hi = lo + transcript_h.min(total);
+
+        for (i, line) in lines[lo..hi.min(total)].iter().enumerate() {
+            at(&mut c, 0, 2 + i);
+            line.emit(&mut c);
+            c.push(Change::ClearToEndOfLine(ColorAttribute::Default));
         }
-        push_line(&mut changes, x, y + box_height.saturating_sub(1), &horizontal);
-
-        let title = format!(" AI Chat - {} ", self.pane_title);
-        push_line(&mut changes, x + 2, y, &truncate_left(&title, box_width.saturating_sub(4)));
-
-        push_line(
-            &mut changes,
-            x + 2,
-            y + 1,
-            &truncate_left(
-                "Enter=send  Esc=close  /watch <instruction>=auto mode  /watch off=disable",
-                inner_width,
-            ),
-        );
-
-        let transcript_lines = self.render_transcript_lines(inner_width);
-        let start = transcript_lines.len().saturating_sub(transcript_height);
-        for (idx, line) in transcript_lines[start..].iter().enumerate() {
-            push_line(&mut changes, x + 2, y + 3 + idx, line);
+        for i in (hi - lo)..transcript_h {
+            at(&mut c, 0, 2 + i);
+            c.push(Change::ClearToEndOfLine(ColorAttribute::Default));
         }
 
-        push_line(
-            &mut changes,
-            x + 2,
-            y + box_height.saturating_sub(4),
-            &truncate_left(
-                &format!(
-                    "Automation: {}",
-                    self.automation_directive
-                        .as_deref()
-                        .unwrap_or("off")
-                ),
-                inner_width,
-            ),
-        );
-        push_line(
-            &mut changes,
-            x + 2,
-            y + box_height.saturating_sub(3),
-            &truncate_left(&format!("Status: {}", self.status), inner_width),
-        );
+        // Scroll indicator (top-right corner of transcript area)
+        if scroll > 0 {
+            let indicator = format!(" ↑ {} lines ", scroll);
+            let ix = w.saturating_sub(indicator.chars().count() + 1);
+            at(&mut c, ix, 2);
+            c.push(Change::Attribute(AttributeChange::Intensity(
+                Intensity::Half,
+            )));
+            c.push(Change::Text(indicator));
+            c.push(Change::Attribute(AttributeChange::Intensity(
+                Intensity::Normal,
+            )));
+        }
 
-        let prompt = format!("> {}", self.input_buffer);
-        let rendered_prompt = truncate_left(&prompt, inner_width);
-        let prompt_row = y + box_height.saturating_sub(2);
-        push_line(&mut changes, x + 2, prompt_row, &rendered_prompt);
-        changes.push(Change::CursorPosition {
-            x: Position::Absolute(x + 2 + rendered_prompt.len()),
-            y: Position::Absolute(prompt_row),
+        // ── Mid separator ────────────────────────────────────────────────────
+        self.draw_separator(&mut c, 0, split, w);
+
+        // ── Status / hints ───────────────────────────────────────────────────
+        at(&mut c, 0, split + 1);
+        c.push(Change::Attribute(AttributeChange::Intensity(
+            Intensity::Half,
+        )));
+        let auto_label = match &self.automation_directive {
+            Some(d) => format!("/watch: {}  ", d),
+            None => String::new(),
+        };
+        let hints = "PgUp/PgDn: scroll  Esc: close";
+        let status_left = format!("  {}  {}", self.status, auto_label);
+        let status_right = format!("{}  ", hints);
+        let gap = w.saturating_sub(status_left.chars().count() + status_right.chars().count());
+        c.push(Change::Text(status_left));
+        c.push(Change::Text(" ".repeat(gap)));
+        c.push(Change::Text(status_right));
+        c.push(Change::Attribute(AttributeChange::Intensity(
+            Intensity::Normal,
+        )));
+
+        // ── Input separator ──────────────────────────────────────────────────
+        self.draw_separator(&mut c, 0, split + 2, w);
+
+        // ── Input area (word-wrapped, multi-row) ─────────────────────────────
+        // Wrap the buffer into lines that fit input_text_w.
+        let wrapped_input: Vec<String> = if self.input_buffer.is_empty() {
+            vec![String::new()]
+        } else {
+            textwrap::wrap(&self.input_buffer, input_text_w)
+                .into_iter()
+                .map(|s| s.into_owned())
+                .collect()
+        };
+
+        // Calculate cursor position based on wrapped lines
+        let mut cursor_row = 0;
+        let mut cursor_col = 0;
+        let mut remaining_pos = self.cursor_position;
+
+        for (line_idx, line) in wrapped_input.iter().enumerate() {
+            let line_char_count = line.chars().count();
+            if remaining_pos <= line_char_count {
+                // Cursor is in this line; use display width for correct full-width char handling.
+                let prefix_byte = char_to_byte_idx(line, remaining_pos);
+                cursor_row = input_first_row + line_idx;
+                cursor_col = 4 + unicode_column_width(&line[..prefix_byte], None); // 4 for "  ❯ "
+                break;
+            } else {
+                // Cursor is after this line
+                remaining_pos -= line_char_count;
+                // Account for newline character (except for last line)
+                if line_idx < wrapped_input.len() - 1 {
+                    remaining_pos -= 1; // for '\n'
+                }
+            }
+        }
+
+        // First row: prompt glyph + first wrapped line.
+        at(&mut c, 0, input_first_row);
+        c.push(Change::Attribute(AttributeChange::Foreground(
+            ColorAttribute::PaletteIndex(AnsiColor::Aqua as u8),
+        )));
+        c.push(Change::Attribute(AttributeChange::Intensity(
+            Intensity::Bold,
+        )));
+        c.push(Change::Text("  ❯ ".to_string()));
+        c.push(Change::Attribute(AttributeChange::Intensity(
+            Intensity::Normal,
+        )));
+        c.push(Change::Attribute(AttributeChange::Foreground(
+            ColorAttribute::Default,
+        )));
+        c.push(Change::Text(wrapped_input[0].clone()));
+        c.push(Change::ClearToEndOfLine(ColorAttribute::Default));
+
+        // Continuation rows (indented to align with text after ❯).
+        for (i, line) in wrapped_input.iter().enumerate().skip(1) {
+            let row = input_first_row + i;
+            if row >= h {
+                break;
+            }
+            at(&mut c, 0, row);
+            c.push(Change::Text(format!("    {}", line)));
+            c.push(Change::ClearToEndOfLine(ColorAttribute::Default));
+        }
+        // Clear remaining input rows.
+        for i in wrapped_input.len()..input_h {
+            let row = input_first_row + i;
+            if row >= h {
+                break;
+            }
+            at(&mut c, 0, row);
+            c.push(Change::ClearToEndOfLine(ColorAttribute::Default));
+        }
+
+        // Place cursor at calculated position.
+        c.push(Change::CursorPosition {
+            x: Position::Absolute(cursor_col.min(w.saturating_sub(1))),
+            y: Position::Absolute(cursor_row.min(h.saturating_sub(1))),
         });
-        changes.push(Change::CursorVisibility(CursorVisibility::Visible));
+        c.push(Change::CursorVisibility(CursorVisibility::Visible));
 
-        term.render(&changes)?;
+        term.render(&c)?;
         term.flush()?;
         Ok(())
     }
 
-    fn render_transcript_lines(&self, width: usize) -> Vec<String> {
-        let mut lines = Vec::new();
+    fn draw_separator(&self, changes: &mut Vec<Change>, x: usize, y: usize, width: usize) {
+        at(changes, x, y);
+        changes.push(Change::Attribute(AttributeChange::Foreground(
+            ColorAttribute::PaletteIndex(AnsiColor::Navy as u8),
+        )));
+        changes.push(Change::Text("─".repeat(width)));
+        changes.push(Change::Attribute(AttributeChange::Foreground(
+            ColorAttribute::Default,
+        )));
+    }
+
+    fn render_transcript(&self, width: usize) -> Vec<StyledLine> {
+        let mut lines: Vec<StyledLine> = Vec::new();
+        let text_width = width.saturating_sub(4).max(1);
+
         for entry in &self.transcript {
-            let prefix = match entry.role {
-                "user" => "You: ",
-                "assistant" => "AI: ",
-                _ => "Info: ",
-            };
-            let rendered = format!("{prefix}{}", entry.text);
-            let wrapped = textwrap::wrap(&rendered, width);
-            if wrapped.is_empty() {
-                lines.push(String::new());
-            } else {
-                lines.extend(wrapped.into_iter().map(|line| line.into_owned()));
+            match entry.role {
+                "user" => {
+                    lines.push(StyledLine::default());
+                    lines.push(StyledLine::colored("  You", AnsiColor::Aqua, true));
+                    for wrapped in wrap_preserving_newlines(&entry.text, text_width) {
+                        lines.push(StyledLine::plain(format!("    {}", wrapped)));
+                    }
+                }
+                "assistant" => {
+                    lines.push(StyledLine::default());
+                    lines.push(StyledLine::colored("  AI", AnsiColor::Lime, true));
+                    for wrapped in wrap_preserving_newlines(&entry.text, text_width) {
+                        lines.push(StyledLine::plain(format!("    {}", wrapped)));
+                    }
+                }
+                _ => {
+                    // System messages: dim, no label
+                    for wrapped in wrap_preserving_newlines(&entry.text, text_width) {
+                        lines.push(StyledLine::dim(format!("  {}", wrapped), AnsiColor::Yellow));
+                    }
+                }
             }
         }
+
         if lines.is_empty() {
-            lines.push(String::new());
+            lines.push(StyledLine::default());
         }
         lines
     }
 }
 
-fn push_line(changes: &mut Vec<Change>, x: usize, y: usize, text: &str) {
+// ── Text helpers ──────────────────────────────────────────────────────────────
+
+/// Convert a char-index cursor position to the corresponding byte offset in `s`.
+fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
+}
+
+// ── Rendering helpers ─────────────────────────────────────────────────────────
+
+fn at(changes: &mut Vec<Change>, x: usize, y: usize) {
     changes.push(Change::CursorPosition {
         x: Position::Absolute(x),
         y: Position::Absolute(y),
     });
-    changes.push(Change::Text(text.to_string()));
 }
 
-fn truncate_left(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return text.to_string();
+/// Split `text` by newlines, then word-wrap each paragraph to `width`.
+/// Empty lines (blank lines in the original) are preserved as empty strings.
+fn wrap_preserving_newlines(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for paragraph in text.split('\n') {
+        if paragraph.trim().is_empty() {
+            out.push(String::new());
+        } else {
+            for line in textwrap::wrap(paragraph, width) {
+                out.push(line.into_owned());
+            }
+        }
     }
-    if width <= 3 {
-        return ".".repeat(width);
+    if out.is_empty() {
+        out.push(String::new());
     }
-    let suffix: String = text
-        .chars()
-        .rev()
-        .take(width - 3)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("...{suffix}")
+    out
 }
+
+fn pad_right(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    if len >= width {
+        text.chars().take(width).collect()
+    } else {
+        format!("{}{}", text, " ".repeat(width - len))
+    }
+}
+
+// ── API / logic helpers ───────────────────────────────────────────────────────
 
 fn parse_assistant_reply(raw: &str) -> anyhow::Result<AssistantReply> {
     if let Ok(reply) = serde_json::from_str(raw) {
@@ -781,10 +1080,14 @@ fn parse_pane_key(key: &str) -> anyhow::Result<PaneKeyCode> {
     })
 }
 
+// ── Public entry point ────────────────────────────────────────────────────────
+
 pub fn ai_chat_overlay(mut term: TermWizTerminal, pane_id: PaneId) -> anyhow::Result<()> {
     let mut overlay = AiChatOverlay::new(pane_id)?;
     overlay.run_loop(&mut term)
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod test {
@@ -839,6 +1142,9 @@ mod test {
             assess_prompt_risk("yes", "sudo wants to delete files permanently"),
             ActionRisk::NeedsConfirmation(_)
         ));
-        assert_eq!(assess_prompt_risk("yes", "GitHub Copilot wants approval"), ActionRisk::Safe);
+        assert_eq!(
+            assess_prompt_risk("yes", "GitHub Copilot wants approval"),
+            ActionRisk::Safe
+        );
     }
 }

@@ -891,7 +891,14 @@ impl TermWindow {
         }
 
         crate::update::start_update_checker();
-        front_end().record_known_window(window, mux_window_id);
+        front_end().record_known_window(window.clone(), mux_window_id);
+
+        // Auto-show AI chat overlay if this is the startup split window
+        if let Some((terminal_pane_id, chat_pane_id)) = crate::STARTUP_AI_CHAT.get().copied() {
+            window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                tw.show_startup_ai_chat(terminal_pane_id, chat_pane_id);
+            })));
+        }
 
         Ok(())
     }
@@ -2379,6 +2386,19 @@ impl TermWindow {
             ai_chat_overlay(term, pane_id)
         });
         self.assign_overlay_for_pane(pane_id, overlay);
+        promise::spawn::spawn(future).detach();
+    }
+
+    fn show_startup_ai_chat(&mut self, terminal_pane_id: PaneId, chat_pane_id: PaneId) {
+        let mux = Mux::get();
+        let chat_pane = match mux.get_pane(chat_pane_id) {
+            Some(p) => p,
+            None => return,
+        };
+        let (overlay, future) = start_overlay_pane(self, &chat_pane, move |_pane_id, term| {
+            ai_chat_overlay(term, terminal_pane_id)
+        });
+        self.assign_overlay_for_pane(chat_pane_id, overlay);
         promise::spawn::spawn(future).detach();
     }
 

@@ -85,13 +85,39 @@ impl Domain for TermWizTerminalDomain {
     }
 }
 
+/// `Write` implementation that forwards bytes written via `pane.writer()` into
+/// the overlay's `input_tx` channel as `InputEvent::Paste` events.
+///
+/// This is required so that IME-composed text (Japanese, Chinese, etc.) reaches
+/// overlay terminals.  WezTerm dispatches `Key::Composed(s)` by calling
+/// `pane.writer().write_all(s.as_bytes())`, which bypasses `key_down` /
+/// `send_paste` and would otherwise disappear into a black-hole `Vec<u8>`.
+struct TermWizWriter {
+    input_tx: Sender<InputEvent>,
+}
+
+impl std::io::Write for TermWizWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if let Ok(s) = std::str::from_utf8(data) {
+            if !s.is_empty() {
+                self.input_tx.send(InputEvent::Paste(s.to_string())).ok();
+            }
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub struct TermWizTerminalPane {
     pane_id: PaneId,
     domain_id: DomainId,
     terminal: Mutex<wezterm_term::Terminal>,
     input_tx: Sender<InputEvent>,
     dead: Mutex<bool>,
-    writer: Mutex<Vec<u8>>,
+    writer: Mutex<TermWizWriter>,
     render_rx: FileDescriptor,
 }
 
@@ -117,7 +143,7 @@ impl TermWizTerminalPane {
             pane_id,
             domain_id,
             terminal,
-            writer: Mutex::new(Vec::new()),
+            writer: Mutex::new(TermWizWriter { input_tx: input_tx.clone() }),
             render_rx,
             input_tx,
             dead: Mutex::new(false),
